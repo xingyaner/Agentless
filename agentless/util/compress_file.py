@@ -157,7 +157,6 @@ def compress_assign_stmts(raw_code, total_lines=30, prefix_lines=10, suffix_line
             )
     return remove_lines(raw_code, remove_line_intervals)
 
-
 def get_skeleton(
     raw_code,
     keep_constant: bool = True,
@@ -167,32 +166,47 @@ def get_skeleton(
     prefix_lines=10,
     suffix_lines=10,
 ):
+    """
+    【OSS-Fuzz 跨语言适配版】
+    功能：为 Python 提取骨架，为 C/C++/Shell 执行文本级降级保护。
+    """
     try:
+        import libcst as cst
+        # 尝试使用 Python AST 解析
         tree = cst.parse_module(raw_code)
-    except:
+        
+        # 如果解析成功，执行 Agentless 原始的压缩逻辑
+        from agentless.util.compress_file import CompressTransformer, compress_assign_stmts
+        
+        transformer = CompressTransformer(keep_constant=keep_constant, keep_indent=True)
+        modified_tree = tree.visit(transformer)
+        code = modified_tree.code
+
+        if compress_assign:
+            code = compress_assign_stmts(
+                code,
+                total_lines=total_lines,
+                prefix_lines=prefix_lines,
+                suffix_lines=suffix_lines,
+            )
+
+        if keep_indent:
+            code = code.replace(CompressTransformer.replacement_string + "\n", "...\n")
+            code = code.replace(CompressTransformer.replacement_string, "...\n")
+        else:
+            pattern = f"\\n[ \\t]*{CompressTransformer.replacement_string}"
+            replacement = "\n..."
+            code = re.sub(pattern, replacement, code)
+        return code
+
+    except Exception:
+        # --- 降级适配：针对 C/C++, Shell, Dockerfile ---
+        # 如果不是 Python 或者解析失败，直接返回原始代码。
+        # 增加一个物理保护：如果文件超过 500 行，截断中间部分以保护提示词窗口。
+        lines = raw_code.splitlines()
+        if len(lines) > 500:
+            return "\n".join(lines[:200]) + "\n\n... [Content truncated to protect context window] ...\n\n" + "\n".join(lines[-200:])
         return raw_code
-
-    transformer = CompressTransformer(keep_constant=keep_constant, keep_indent=True)
-    modified_tree = tree.visit(transformer)
-    code = modified_tree.code
-
-    if compress_assign:
-        code = compress_assign_stmts(
-            code,
-            total_lines=total_lines,
-            prefix_lines=prefix_lines,
-            suffix_lines=suffix_lines,
-        )
-
-    if keep_indent:
-        code = code.replace(CompressTransformer.replacement_string + "\n", "...\n")
-        code = code.replace(CompressTransformer.replacement_string, "...\n")
-    else:
-        pattern = f"\\n[ \\t]*{CompressTransformer.replacement_string}"
-        replacement = "\n..."
-        code = re.sub(pattern, replacement, code)
-
-    return code
 
 
 def test_compress():

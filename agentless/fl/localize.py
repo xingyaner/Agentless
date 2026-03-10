@@ -4,7 +4,6 @@ import json
 import os
 from threading import Lock
 
-from datasets import load_dataset
 from tqdm import tqdm
 
 from agentless.fl.FL import LLMFL
@@ -611,6 +610,80 @@ def main():
     else:
         localize(args)
 
+
+def localize_instance_oss_fuzz(
+        project_info, args, log_content, logger, **kwargs
+):
+    from agentless.fl.FL import LLMFL
+    import os
+
+    instance_id = project_info["project_name"]
+    source_path = project_info["project_source_path"]
+    config_path = os.path.abspath(os.path.join(os.getcwd(), "oss-fuzz", "projects", instance_id))
+
+    structure_dict = {}
+    allowed_exts = {'.c', '.cpp', '.h', '.hpp', '.cc', '.sh', '.py', '.txt', 'Dockerfile', 'Makefile'}
+
+    # --- 1. 扫描并注入 PATH_ID ---
+    all_paths = []
+
+    def scan_path(target_base):
+        if not os.path.exists(target_base): return
+        for root, _, files in os.walk(target_base):
+            for file in files:
+                if any(file.endswith(ext) for ext in allowed_exts) or file == 'Dockerfile':
+                    full_p = os.path.join(root, file)
+                    rel_p = os.path.relpath(full_p, os.getcwd())
+                    all_paths.append(rel_p)
+                    try:
+                        with open(full_p, 'r', encoding='utf-8', errors='ignore') as f:
+                            structure_dict[rel_p] = f.readlines()
+                    except:
+                        pass
+
+    scan_path(config_path)
+    scan_path(source_path)
+
+    # --- 2. 构造带 PATH_ID 的文件树展示 ---
+    formatted_structure = ""
+    for i, p in enumerate(sorted(all_paths)):
+        formatted_structure += f"[PATH_ID_{i}]: {p}\n"
+
+    # --- 3. 增强版 Prompt 约束 ---
+    # 替换原本 LLMFL 中的提示词模板
+    custom_prompt = (
+        "STRICT PATH RULES:\n"
+        "1. You MUST return the full, comprehensive path of the file.\n"
+        "   Example: Use 'oss-fuzz/projects/hiredis/build.sh' instead of just 'build.sh'.\n"
+        "2. You can also refer to files using their [PATH_ID_X].\n"
+        "3. Do NOT guess paths; only use those listed in the Repository Structure.\n\n"
+        "### Repository Structure ###\n"
+        f"{formatted_structure}"
+    )
+
+    # 临时覆盖 LLMFL 的默认 Prompt（假设 LLMFL 逻辑支持通过传入参数或属性修改）
+    fl = LLMFL(instance_id, structure_dict, log_content, args.model, args.backend, logger)
+    # 修改其内部提示词字段
+    fl.obtain_relevant_files_prompt = fl.obtain_relevant_files_prompt.replace("{structure}", custom_prompt)
+
+    found_files, _, _ = fl.localize(mock=args.mock)
+
+    # 【终极补丁：视野强制对齐】
+    # 既然这是 Fuzzing Build Error，build.sh 和 Dockerfile 是最高概率的修复目标
+    # 我们强制将它们加入 found_files 的开头，确保 Repair 阶段 100% 能看到内容
+    config_files = []
+    for rel_path in structure_dict.keys():
+        if "build.sh" in rel_path or "Dockerfile" in rel_path:
+            config_files.append(rel_path)
+
+    # 将配置文件排在最前面，并去重
+    final_files = config_files + [f for f in found_files if f not in config_files]
+
+    return {
+        "instance_id": instance_id,
+        "found_files": final_files[:args.top_n + 2],  # 稍微扩大范围以容纳配置+源码
+        "structure": structure_dict
+    }
 
 if __name__ == "__main__":
     main()

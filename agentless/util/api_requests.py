@@ -7,18 +7,24 @@ import tiktoken
 
 
 def num_tokens_from_messages(message, model="gpt-3.5-turbo-0301"):
-    """Returns the number of tokens used by a list of messages."""
+    """
+    【修正版】全量计算消息列表的 Token。
+    """
     try:
-        encoding = tiktoken.encoding_for_model(model)
-    except KeyError:
+        import tiktoken
         encoding = tiktoken.get_encoding("cl100k_base")
-    if isinstance(message, list):
-        # use last message.
-        num_tokens = len(encoding.encode(message[0]["content"]))
-    else:
-        num_tokens = len(encoding.encode(message))
-    return num_tokens
+    except:
+        return 0
 
+    if isinstance(message, list):
+        total_tokens = 0
+        for m in message:
+            # 统计 role 和 content 的总和
+            total_tokens += len(encoding.encode(m.get("content", "")))
+            total_tokens += 4 # 基础 Overhead
+        return total_tokens
+    else:
+        return len(encoding.encode(str(message)))
 
 def create_chatgpt_config(
     message: Union[str, list],

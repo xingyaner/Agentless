@@ -240,8 +240,32 @@ Return just the locations wrapped with ```.
         self.logger = logger
 
     def _parse_model_return_lines(self, content: str) -> list[str]:
-        if content:
-            return content.strip().split("\n")
+        """
+        【Reasoner 适配版】从模型输出（包含思维链和 Markdown）中提取文件路径。
+        """
+        import re
+        if not content:
+            return []
+        
+        # 1. 提取所有 Markdown 代码块内容
+        code_blocks = re.findall(r"```(?:\w+)?\n(.*?)\n```", content, re.DOTALL)
+        if code_blocks:
+            lines = "\n".join(code_blocks).split("\n")
+        else:
+            lines = content.strip().split("\n")
+            
+        clean_lines = []
+        # OSS-Fuzz 环境下的合法文件后缀白名单
+        valid_exts = ('.c', '.cpp', '.h', '.cc', '.sh', 'Dockerfile', '.py', '.yml', '.yaml')
+        
+        for line in lines:
+            line = line.strip().strip('`').strip()
+            if line and not line.startswith('#'):
+                # 判定规则：包含路径斜杠，或者以白名单后缀结尾
+                if '/' in line or line.lower().endswith(valid_exts):
+                    clean_lines.append(line)
+        return clean_lines
+
 
     def localize_irrelevant(self, top_n=1, mock=False):
         from agentless.util.api_requests import num_tokens_from_messages
@@ -556,9 +580,13 @@ Return just the locations wrapped with ```.
         mock=False,
         keep_old_order=False,
     ):
+        """
+        【已修复语法】定位具体代码行的核心逻辑。
+        """
         from agentless.util.api_requests import num_tokens_from_messages
         from agentless.util.model import make_model
 
+        # 1. 构建文件上下文
         file_contents = get_repo_files(self.structure, file_names)
         topn_content, file_loc_intervals = construct_topn_file_context(
             coarse_locs,
@@ -571,54 +599,32 @@ Return just the locations wrapped with ```.
             sticky_scroll=sticky_scroll,
             no_line_number=no_line_number,
         )
+
+        # 2. 选择提示词模板
         if no_line_number:
             template = self.obtain_relevant_code_combine_top_n_no_line_number_prompt
         else:
             template = self.obtain_relevant_code_combine_top_n_prompt
+
         message = template.format(
             problem_statement=self.problem_statement, file_contents=topn_content
         )
         self.logger.info(f"prompting with message:\n{message}")
-        self.logger.info("=" * 80)
 
-        def message_too_long(message):
-            return (
-                num_tokens_from_messages(message, self.model_name) >= MAX_CONTEXT_LENGTH
-            )
-
-        while message_too_long(message) and len(coarse_locs) > 1:
-            self.logger.info(f"reducing to \n{len(coarse_locs)} files")
+        # 3. 处理上下文超长的情况
+        max_context = 128000 
+        while num_tokens_from_messages(message, self.model_name) >= max_context and len(coarse_locs) > 1:
+            self.logger.info(f"Context too long, reducing files...")
             coarse_locs.popitem()
-            topn_content, file_loc_intervals = construct_topn_file_context(
-                coarse_locs,
-                file_names,
-                file_contents,
-                self.structure,
-                context_window=context_window,
-                loc_interval=True,
-                add_space=add_space,
-                sticky_scroll=sticky_scroll,
-                no_line_number=no_line_number,
+            topn_content, _ = construct_topn_file_context(
+                coarse_locs, file_names, file_contents, self.structure, context_window=context_window
             )
-            message = template.format(
-                problem_statement=self.problem_statement, file_contents=topn_content
-            )
-
-        if message_too_long(message):
-            raise ValueError(
-                "The remaining file content is too long to fit within the context length"
-            )
+            message = template.format(problem_statement=self.problem_statement, file_contents=topn_content)
 
         if mock:
-            self.logger.info("Skipping querying model since mock=True")
-            traj = {
-                "prompt": message,
-                "usage": {
-                    "prompt_tokens": num_tokens_from_messages(message, self.model_name),
-                },
-            }
-            return [], {"raw_output_loc": ""}, traj
+            return [], {"raw_output_loc": ""}, {}
 
+        # 4. 调用模型生成候选
         model = make_model(
             model=self.model_name,
             backend=self.backend,
@@ -627,58 +633,36 @@ Return just the locations wrapped with ```.
             temperature=temperature,
             batch_size=num_samples,
         )
-        raw_trajs = model.codegen(
-            message, num_samples=num_samples, prompt_cache=num_samples > 1
-        )
+        raw_trajs = model.codegen(message, num_samples=num_samples, prompt_cache=num_samples > 1)
 
-        # Merge trajectories
+        # 5. 合并并解析结果
         raw_outputs = [raw_traj["response"] for raw_traj in raw_trajs]
         traj = {
             "prompt": message,
             "response": raw_outputs,
-            "usage": {  # merge token usage
-                "completion_tokens": sum(
-                    raw_traj["usage"]["completion_tokens"] for raw_traj in raw_trajs
-                ),
-                "prompt_tokens": sum(
-                    raw_traj["usage"]["prompt_tokens"] for raw_traj in raw_trajs
-                ),
+            "usage": {
+                "completion_tokens": sum(r["usage"]["completion_tokens"] for r in raw_trajs),
+                "prompt_tokens": sum(r["usage"]["prompt_tokens"] for r in raw_trajs),
             },
         }
+
         model_found_locs_separated_in_samples = []
         for raw_output in raw_outputs:
+            from agentless.util.postprocess_data import extract_code_blocks, extract_locs_for_files
             model_found_locs = extract_code_blocks(raw_output)
             model_found_locs_separated = extract_locs_for_files(
                 model_found_locs, file_names, keep_old_order
             )
             model_found_locs_separated_in_samples.append(model_found_locs_separated)
 
-            self.logger.info(f"==== raw output ====")
-            self.logger.info(raw_output)
-            self.logger.info("=" * 80)
-            self.logger.info(f"==== extracted locs ====")
-            for loc in model_found_locs_separated:
-                self.logger.info(loc)
-            self.logger.info("=" * 80)
-        self.logger.info("==== Input coarse_locs")
-        coarse_info = ""
-        for fn, found_locs in coarse_locs.items():
-            coarse_info += f"### {fn}\n"
-            if isinstance(found_locs, str):
-                coarse_info += found_locs + "\n"
-            else:
-                coarse_info += "\n".join(found_locs) + "\n"
-        self.logger.info("\n" + coarse_info)
-        if len(model_found_locs_separated_in_samples) == 1:
-            model_found_locs_separated_in_samples = (
-                model_found_locs_separated_in_samples[0]
-            )
+        # 6. 记录输入信息
+        coarse_info = "".join([f"### {fn}\n{str(found_locs)}\n" for fn, found_locs in coarse_locs.items()])
+        self.logger.info(f"Input coarse_locs:\n{coarse_info}")
 
-        return (
-            model_found_locs_separated_in_samples,
-            {"raw_output_loc": raw_outputs},
-            traj,
-        )
+        if len(model_found_locs_separated_in_samples) == 1:
+            model_found_locs_separated_in_samples = model_found_locs_separated_in_samples[0]
+
+        return model_found_locs_separated_in_samples, {"raw_output_loc": raw_outputs}, traj
 
     def localize_line_from_raw_text(
         self,

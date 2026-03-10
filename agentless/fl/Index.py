@@ -19,7 +19,6 @@ from llama_index.embeddings.openai import OpenAIEmbedding
 from agentless.util.api_requests import num_tokens_from_messages
 from agentless.util.index_skeleton import parse_global_stmt_from_code
 from agentless.util.preprocess_data import (
-    clean_method_left_space,
     get_full_file_paths_and_classes_and_functions,
 )
 from get_repo_structure.get_repo_structure import parse_python_file
@@ -121,7 +120,7 @@ def build_file_documents_complex(
             method_meta_data = copy.deepcopy(base_meta_data)
             method_meta_data["Class Name"] = clazz["name"]
             method_meta_data["Method Name"] = class_method["name"]
-            content = clean_method_left_space("\n".join(class_method["text"]))
+            # content = clean_method_left_space("\n".join(class_method["text"]))
 
             doc = Document(
                 text=content,
@@ -214,50 +213,57 @@ class EmbeddingIndex(ABC):
             raise NotImplementedError
 
     def retrieve(self, mock=False):
-
         persist_dir = self.persist_dir.format(instance_id=self.instance_id)
-        token_counter = TokenCountingHandler(
-            tokenizer=tiktoken.encoding_for_model("text-embedding-3-small").encode
-        )
+        # 兼容性处理：如果没有 tiktoken，使用模拟计数器以防崩溃
+        try:
+            token_counter = TokenCountingHandler(
+                tokenizer=tiktoken.encoding_for_model("text-embedding-3-small").encode
+            )
+        except Exception:
+            # 兜底计数器
+            class MockCounter:
+                total_embedding_token_count = 0
+                def reset_counts(self): pass
+            token_counter = MockCounter()
+
         if not os.path.exists(persist_dir) or mock:
             files, _, _ = get_full_file_paths_and_classes_and_functions(self.structure)
             filtered_files = self.filter_files(files)
-            self.logger.info(f"Total number of considered files: {len(filtered_files)}")
-            print(f"Total number of considered files: {len(filtered_files)}")
             documents = []
 
-            for file_content in files:
-                content = "\n".join(file_content[1])
-                file_name = file_content[0]
+            for file_info in files:
+                file_name = file_info[0]
+                if file_name not in filtered_files: continue
 
-                if file_name not in filtered_files:
-                    continue
+                # 统一内容格式
+                raw_c = file_info[1]
+                content = "".join(raw_c) if isinstance(raw_c, list) else str(raw_c)
 
-                # create documents
-                class_info, function_names, _ = parse_python_file(None, content)
-                if self.index_type == "simple":
-                    docs = build_file_documents_simple(
-                        class_info, function_names, file_name, content
-                    )
-                elif self.index_type == "complex":
-                    docs = build_file_documents_complex(
-                        class_info, function_names, file_name, content
-                    )
-                else:
-                    raise NotImplementedError
+                docs = []
+                # 【修复关键】：只有 Python 使用 AST 解析，其他文件全部走简单文档模式
+                if file_name.lower().endswith(".py"):
+                    try:
+                        from get_repo_structure.get_repo_structure import parse_python_file
+                        c_info, f_info, _ = parse_python_file(None, content)
+                        docs = build_file_documents_complex(c_info, f_info, file_name, content)
+                    except:
+                        pass
 
+                # 如果是 C++, Shell, Dockerfile 或解析失败的回退
+                if not docs:
+                    docs = build_file_documents_simple(clazzes=[], functions=[], file_name=file_name,
+                                                       file_content=content)
                 documents.extend(docs)
 
             self.logger.info(f"Total number of documents: {len(documents)}")
             print(f"Total number of documents: {len(documents)}")
 
             if mock:
-                embed_model = MockEmbedding(
-                    embed_dim=1024
-                )  # embedding dimension does not matter for mocking.
+                embed_model = MockEmbedding(embed_dim=1024)
                 Settings.callback_manager = CallbackManager([token_counter])
             else:
                 embed_model = OpenAIEmbedding(model_name="text-embedding-3-small")
+                
             index = VectorStoreIndex.from_documents(documents, embed_model=embed_model)
             index.storage_context.persist(persist_dir=persist_dir)
         else:
@@ -269,9 +275,7 @@ class EmbeddingIndex(ABC):
         retriever = VectorIndexRetriever(index=index, similarity_top_k=100)
         documents = retriever.retrieve(self.problem_statement)
 
-        self.logger.info(
-            f"Embedding Tokens: {token_counter.total_embedding_token_count}"
-        )
+        self.logger.info(f"Embedding Tokens: {token_counter.total_embedding_token_count}")
         print(f"Embedding Tokens: {token_counter.total_embedding_token_count}")
 
         traj = {
@@ -295,7 +299,6 @@ class EmbeddingIndex(ABC):
                 self.logger.info(file_name)
 
             self.logger.info(node.node.text)
-
             meta_infos.append({"code": node.node.text, "metadata": node.node.metadata})
 
         return file_names, meta_infos, traj

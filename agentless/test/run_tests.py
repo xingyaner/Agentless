@@ -4,27 +4,32 @@ import platform
 import re
 import resource
 import traceback
+import subprocess
+from typing import Optional, Dict, Any  # 确保导入了 Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
-
-import docker
-from swebench.harness.constants import (
-    FAIL_TO_PASS,
-    KEY_INSTANCE_ID,
-    MAP_REPO_VERSION_TO_SPECS,
-    PASS_TO_PASS,
-    USE_X86,
-    SWEbenchInstance,
-)
-from swebench.harness.docker_build import build_env_images
-from swebench.harness.run_evaluation import get_dataset_from_preds, run_instance
-from swebench.harness.test_spec import (
-    TestSpec,
-    make_env_script_list,
-    make_repo_script_list,
-)
-from swebench.harness.utils import get_test_directives
 from tqdm import tqdm
+
+# =================================================================
+# --- 【隔离适配层】定义 Mock 占位符，防止 NameError ---
+# =================================================================
+
+# 定义原代码函数签名中引用的所有类名和常量
+SWEbenchInstance = Any
+TestSpec = Any
+FAIL_TO_PASS = "FAIL_TO_PASS"
+KEY_INSTANCE_ID = "instance_id"
+MAP_REPO_VERSION_TO_SPECS = {}
+PASS_TO_PASS = "PASS_TO_PASS"
+USE_X86 = []
+
+# 定义 Mock 函数，防止原代码加载时因找不到导入的函数而报错
+def build_env_images(*args, **kwargs): pass
+def get_dataset_from_preds(*args, **kwargs): return []
+def run_instance(*args, **kwargs): pass
+def make_env_script_list(*args, **kwargs): return []
+def make_repo_script_list(*args, **kwargs): return []
+def get_test_directives(*args, **kwargs): return []
+
 
 OPEN_FILE_LIMIT = 4096
 
@@ -46,6 +51,131 @@ index 0000000..e69de29
 +# This is a commented out line
 """
 
+import re
+import os
+import subprocess
+from typing import Optional
+
+
+
+def run_fuzz_build_streaming(project_name, oss_fuzz_path, sanitizer, engine, architecture, mount_path=None) -> dict:
+    """
+    【加固版】确保日志从第一行到最后一行全量捕获，并清洗 ANSI。
+    """
+    import os, subprocess, re, sys
+    LOG_FILE = "fuzz_build_log_file/fuzz_build_log.txt"
+    os.makedirs("fuzz_build_log_file", exist_ok=True)
+
+    def clean_ansi(text):
+        return re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
+
+    try:
+        helper = os.path.join(oss_fuzz_path, "infra/helper.py")
+        command = ["python3.10", helper, "build_fuzzers"]
+        if mount_path: command.extend([project_name, mount_path])
+        command.extend(["--sanitizer", sanitizer, "--engine", engine, "--architecture", architecture])
+        if not mount_path: command.append(project_name)
+
+        # 核心：使用行缓冲 + stderr 合并
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, cwd=oss_fuzz_path, encoding='utf-8', errors='ignore'
+        )
+
+        full_log = []
+        # 使用 iter 保证实时性，防止末尾截断
+        for line in iter(process.stdout.readline, ''):
+            cleaned = clean_ansi(line)
+            sys.stdout.write(cleaned) # 同步到控制台
+            sys.stdout.flush()
+            full_log.append(cleaned)
+        
+        process.wait()
+        final_content = "".join(full_log)
+        
+        # 判定
+        success = (process.returncode == 0) and ("successfully built" in final_content.lower())
+        
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            f.write("success" if success else final_content)
+            f.flush()
+            os.fsync(f.fileno()) # 物理强制落盘
+            
+        return {"status": "success" if success else "error"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+def apply_patch(solution_file_path: str) -> dict:
+    """
+    【全量原始版 + 统计支持】应用补丁并返回修改规模。
+    """
+    print(f"--- [OSS-Fuzz Patch] Applying patch from {solution_file_path} ---")
+    applied_count = 0
+    total_lines_modified = 0
+    errors = []
+    try:
+        if not os.path.exists(solution_file_path):
+            return {"status": "error", "message": "File not found", "files": 0, "lines": 0}
+        with open(solution_file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        patch_blocks = content.split('---=== FILE ===---')[1:]
+        if not patch_blocks:
+            return {"status": "error", "message": "Invalid format", "files": 0, "lines": 0}
+
+        for block in patch_blocks:
+            try:
+                parts = block.split('---=== ORIGINAL ===---')
+                file_path = parts[0].strip()
+                content_parts = parts[1].split('---=== REPLACEMENT ===---')
+                original_block = content_parts[0].strip("\n\r")
+                replacement_block = content_parts[1].strip("\n\r")
+                if not os.path.exists(file_path):
+                    errors.append(f"File missing: {file_path}")
+                    continue
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    file_content = f.read()
+                if original_block in file_content:
+                    new_content = file_content.replace(original_block, replacement_block, 1)
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(new_content)
+                    applied_count += 1
+                    total_lines_modified += len(replacement_block.splitlines())
+                    print(f"--- [Success] Applied patch to: {file_path} ---")
+                else:
+                    file_lines = file_content.splitlines()
+                    first_line_orig = original_block.splitlines()[0].strip()
+                    context_snippet = "No similar context found."
+                    for i, line in enumerate(file_lines):
+                        if first_line_orig in line:
+                            start, end = max(0, i - 3), min(len(file_lines), i + 7)
+                            context_snippet = "\n".join(file_lines[start:end])
+                            break
+                    errors.append(f"Match failed for {file_path}.\n### ACTUAL CONTENT ###\n{context_snippet}")
+            except Exception as e:
+                errors.append(str(e))
+        
+        status = "success" if applied_count > 0 else "error"
+        return {"status": status, "message": "\n".join(errors), "files": applied_count, "lines": total_lines_modified}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "files": 0, "lines": 0}
+
+
+def run_oss_fuzz_validation(instance_id, model_patch, project_metadata):
+    """
+    【量化适配】整合全量工具并传回统计指标。
+    """
+    temp_solution = "agentless_solution_temp.txt"
+    with open(temp_solution, "w", encoding="utf-8") as f: f.write(model_patch)
+    p_res = apply_patch(temp_solution)
+    if p_res['status'] == "error":
+        return {"success": False, "files": 0, "lines": 0}
+    
+    build_res = run_fuzz_build_streaming(
+        instance_id, os.path.abspath("./oss-fuzz"),
+        project_metadata.get('sanitizer','address'), project_metadata.get('engine','libfuzzer'),
+        project_metadata.get('architecture','x86_64'), project_metadata.get('project_source_path')
+    )
+    return {"success": build_res['status'] == "success", "files": p_res['files'], "lines": p_res['lines']}
 
 def remove_ansi_sequences(input_string):
     ansi_escape_pattern = r"\x1b\[\d+m"
