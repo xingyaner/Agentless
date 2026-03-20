@@ -16,16 +16,17 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 # =================================================================
 # --- 1. 配置 DeepSeek Reasoner (R1) ---
 # =================================================================
-DPSEEK_API_KEY = "sk-cf1e07ade551446ca2a79d8c22b299cd"
+DPSEEK_API_KEY = "sk-"
 os.environ["DPSEEK_API_KEY"] = DPSEEK_API_KEY
 
 Settings.llm = OpenAILike(
-    model="deepseek-reasoner",
+    model="deepseek-chat",
     api_key=DPSEEK_API_KEY,
-    api_base="https://api.deepseek.com",
+    api_base="https://api.deepseek.com/v1",
     max_tokens=8192,
     is_chat_model=True,
-    additional_kwargs={"extra_body": {"thinking": {"type": "enabled"}}}
+    additional_kwargs={}
+    # additional_kwargs={"extra_body": {"thinking": {"type": "enabled"}}}
 )
 Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
@@ -144,36 +145,66 @@ def update_yaml_report(file_path, row_index, result):
 # =================================================================
 # --- 3. 统计适配封装 ---
 # =================================================================
-
 def process_loc_oss_fuzz_with_stats(loc, args, log_content, logger):
     """
-    【统计完整版】调用 Repair 模块并捕获 R1 真实的 Token 消耗。
+    【统计完整修复版】调用 Repair 模块并捕获真实的 Token 消耗。
+    修复了 'CompletionUsage' 对象不可索引的 Bug。
     """
     from agentless.util.preprocess_data import get_full_file_paths_and_classes_and_functions, get_repo_files
-    from agentless.repair.repair import construct_topn_file_context, repair_prompt_combine_topn_cot_diff, make_model, \
+    from agentless.repair.repair import (
+        construct_topn_file_context,
+        repair_prompt_combine_topn_cot_diff,
+        make_model,
         _post_process_multifile_repair
+    )
 
     pred_files = loc["found_files"][:args.top_n]
     file_contents = get_repo_files(loc["structure"], pred_files)
 
     # 强制构建包含代码的上下文
     virtual_locs = {fn: ["line: 1"] for fn in pred_files}
-    topn_content, file_loc_intervals = construct_topn_file_context(virtual_locs, pred_files, file_contents,
-                                                                   loc["structure"], 1000)
+    topn_content, file_loc_intervals = construct_topn_file_context(
+        virtual_locs, pred_files, file_contents, loc["structure"], 1000
+    )
 
-    prompt = repair_prompt_combine_topn_cot_diff.format(problem_statement=log_content, content=topn_content.rstrip())
+    prompt = repair_prompt_combine_topn_cot_diff.format(
+        problem_statement=log_content,
+        content=topn_content.rstrip()
+    )
 
-    # 调用模型工厂 (make_model 内部会抓取 token 并打印)
-    model_obj = make_model(model=args.model, logger=logger, backend=args.backend, max_tokens=8192, temperature=0.0)
+    # 调用模型工厂
+    model_obj = make_model(
+        model=args.model,
+        logger=logger,
+        backend=args.backend,
+        max_tokens=8192,
+        temperature=0.0
+    )
     trajs = model_obj.codegen(prompt, num_samples=args.max_samples)
 
-    # 累加 Token
-    total_tokens = sum(t['usage']['prompt_tokens'] + t['usage']['completion_tokens'] for t in trajs)
+    # --- 核心修复逻辑：兼容对象与字典的 Token 累加 ---
+    total_tokens = 0
+    for t in trajs:
+        usage = t.get('usage', {})
+        if isinstance(usage, dict):
+            # 如果是字典（Mock 或 旧版 SDK）
+            p_tok = usage.get('prompt_tokens', 0)
+            c_tok = usage.get('completion_tokens', 0)
+        else:
+            # 如果是 CompletionUsage 对象（新版 SDK）
+            p_tok = getattr(usage, 'prompt_tokens', 0)
+            c_tok = getattr(usage, 'completion_tokens', 0)
+        total_tokens += (p_tok + c_tok)
 
     for traj in trajs:
-        # 使用我们之前重写的鲁棒匹配提取逻辑
-        edited_files, new_contents = _post_process_multifile_repair(traj["response"], file_contents, logger,
-                                                                    file_loc_intervals, diff_format=True)
+        # 使用鲁棒匹配提取逻辑
+        edited_files, new_contents = _post_process_multifile_repair(
+            traj["response"],
+            file_contents,
+            logger,
+            file_loc_intervals,
+            diff_format=True
+        )
 
         formatted_patch = ""
         for f, new_c in zip(edited_files, new_contents):
@@ -186,7 +217,6 @@ def process_loc_oss_fuzz_with_stats(loc, args, log_content, logger):
             return formatted_patch, total_tokens
 
     return "", total_tokens
-
 
 # =================================================================
 # --- 4. 主循环 ---
@@ -209,7 +239,7 @@ async def run_baseline():
     class Args:
         file_level = True
         top_n = 3
-        model = "deepseek-reasoner"
+        model = "deepseek-chat"
         backend = "deepseek"
         mock = False
         context_window = 10

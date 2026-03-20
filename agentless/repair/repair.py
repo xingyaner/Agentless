@@ -269,7 +269,7 @@ def process_loc_oss_fuzz(loc, args, log_content, project_info, logger):
     # =================================================================
 
     # 正式开始 Repair (DeepSeek R1)
-    model_obj = make_model(model=args.model, logger=logger, backend=args.backend, max_tokens=16384)
+    model_obj = make_model(model=args.model, logger=logger, backend=args.backend, max_tokens=8192, temperature=0.0)
     trajs = model_obj.codegen(prompt, num_samples=args.max_samples)
 
     for traj in trajs:
