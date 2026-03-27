@@ -13,9 +13,6 @@ from llama_index.core import Settings
 from llama_index.llms.openai_like import OpenAILike
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 
-# =================================================================
-# --- 1. 配置 DeepSeek Reasoner (R1) ---
-# =================================================================
 DPSEEK_API_KEY = "sk-"
 os.environ["DPSEEK_API_KEY"] = DPSEEK_API_KEY
 
@@ -32,7 +29,6 @@ Settings.embed_model = HuggingFaceEmbedding(model_name="BAAI/bge-small-en-v1.5")
 
 
 class StreamToLogger:
-    """将 sys.stdout/stderr 的输出实时转到 Logger 中记录"""
     def __init__(self, logger, level=logging.INFO):
         self.logger = logger
         self.level = level
@@ -40,7 +36,6 @@ class StreamToLogger:
 
     def write(self, buf):
         for line in buf.rstrip().splitlines():
-            # 记录到物理文件
             self.logger.log(self.level, line.rstrip())
 
     def flush(self):
@@ -142,14 +137,7 @@ def update_yaml_report(file_path, row_index, result):
     with open(file_path, 'w', encoding='utf-8') as f: yaml.dump(data, f, sort_keys=False)
 
 
-# =================================================================
-# --- 3. 统计适配封装 ---
-# =================================================================
 def process_loc_oss_fuzz_with_stats(loc, args, log_content, logger):
-    """
-    【统计完整修复版】调用 Repair 模块并捕获真实的 Token 消耗。
-    修复了 'CompletionUsage' 对象不可索引的 Bug。
-    """
     from agentless.util.preprocess_data import get_full_file_paths_and_classes_and_functions, get_repo_files
     from agentless.repair.repair import (
         construct_topn_file_context,
@@ -161,7 +149,6 @@ def process_loc_oss_fuzz_with_stats(loc, args, log_content, logger):
     pred_files = loc["found_files"][:args.top_n]
     file_contents = get_repo_files(loc["structure"], pred_files)
 
-    # 强制构建包含代码的上下文
     virtual_locs = {fn: ["line: 1"] for fn in pred_files}
     topn_content, file_loc_intervals = construct_topn_file_context(
         virtual_locs, pred_files, file_contents, loc["structure"], 1000
@@ -172,7 +159,6 @@ def process_loc_oss_fuzz_with_stats(loc, args, log_content, logger):
         content=topn_content.rstrip()
     )
 
-    # 调用模型工厂
     model_obj = make_model(
         model=args.model,
         logger=logger,
@@ -182,22 +168,18 @@ def process_loc_oss_fuzz_with_stats(loc, args, log_content, logger):
     )
     trajs = model_obj.codegen(prompt, num_samples=args.max_samples)
 
-    # --- 核心修复逻辑：兼容对象与字典的 Token 累加 ---
     total_tokens = 0
     for t in trajs:
         usage = t.get('usage', {})
         if isinstance(usage, dict):
-            # 如果是字典（Mock 或 旧版 SDK）
             p_tok = usage.get('prompt_tokens', 0)
             c_tok = usage.get('completion_tokens', 0)
         else:
-            # 如果是 CompletionUsage 对象（新版 SDK）
             p_tok = getattr(usage, 'prompt_tokens', 0)
             c_tok = getattr(usage, 'completion_tokens', 0)
         total_tokens += (p_tok + c_tok)
 
     for traj in trajs:
-        # 使用鲁棒匹配提取逻辑
         edited_files, new_contents = _post_process_multifile_repair(
             traj["response"],
             file_contents,
@@ -218,24 +200,14 @@ def process_loc_oss_fuzz_with_stats(loc, args, log_content, logger):
 
     return "", total_tokens
 
-# =================================================================
-# --- 4. 主循环 ---
-# =================================================================
 
 async def run_baseline():
-    """
-    【终极鲁棒版】驱动 Agentless Pipeline 在 OSS-Fuzz 环境下运行。
-    1. 物理环境全量备份与重定向控制台日志。
-    2. 物理路径模糊对齐，解决 Context Empty 问题。
-    3. 取消精确匹配，确保补丁 100% 物理对齐。
-    """
     YAML_FILE = 'projects.yaml'
     res = read_projects_from_yaml(YAML_FILE)
     if res['status'] == 'error' or not res['projects']:
         print("--- [Baseline] No eligible projects to process. ---")
         return
 
-    # 统一参数配置 (模拟命令行参数)
     class Args:
         file_level = True
         top_n = 3
@@ -243,7 +215,7 @@ async def run_baseline():
         backend = "deepseek"
         mock = False
         context_window = 10
-        max_samples = 3
+        max_samples = 6
 
     args = Args()
 
@@ -251,15 +223,12 @@ async def run_baseline():
         p_name = project['project_name']
         row_index = project['row_index']
 
-        # 初始化当前项目的 Logger
         logger = setup_project_logger(p_name)
         start_time = time.time()
 
-        # 备份标准输出
         stdout_bak = sys.stdout
         stderr_bak = sys.stderr
 
-        # 开启日志全量捕获 (将控制台 print 全部转入 logger)
         sys.stdout = StreamToLogger(logger, logging.INFO)
         sys.stderr = StreamToLogger(logger, logging.ERROR)
 
@@ -271,7 +240,6 @@ async def run_baseline():
             print(f"\n🚀 [Baseline R1] STARTING REPAIR: {p_name}")
             print(f"📍 Target SHA: {project['software_sha']}")
 
-            # --- A. 环境物理锚定 ---
             checkout_oss_fuzz_commit(project['oss_fuzz_sha'])
             checkout_project_commit(project)
 
@@ -281,22 +249,13 @@ async def run_baseline():
             with open(project['original_log_path'], 'r', errors='ignore') as f:
                 log_content = f.read()
 
-            # --- B. 执行 Agentless 修复流水线 ---
-
-            # 1. 定位 (Localization)
-            # 内部已适配双门径扫描 (Source + Config)
             from agentless.fl.localize import localize_instance_oss_fuzz
             loc_res = localize_instance_oss_fuzz(project, args, log_content, logger)
 
-            # 2. 修复 (Repair)
-            # 内部已适配缩进无关匹配，会自动校准 ORIGINAL 块
-            # 返回 patch 内容与真实的 token 消耗统计
             patch_str, token_usage = process_loc_oss_fuzz_with_stats(loc_res, args, log_content, logger)
 
-            # 3. 验证 (Validation)
             if patch_str:
                 from agentless.test.run_tests import run_oss_fuzz_validation
-                # 执行物理构建并获取修改规模指标
                 val_data = run_oss_fuzz_validation(p_name, patch_str, project)
 
                 final_success = val_data.get('success', False)
@@ -305,7 +264,6 @@ async def run_baseline():
             else:
                 print(f"--- [Baseline Warning] No valid patch blocks extracted for {p_name}. ---")
 
-            # --- C. 输出量化报告 ---
             duration = (time.time() - start_time) / 60
             report = (
                 f"\n{'=' * 60}\n"
@@ -319,22 +277,19 @@ async def run_baseline():
                 f"  - [TIME COST]      {duration:.2f} minutes\n"
                 f"{'=' * 60}\n"
             )
-            print(report)  # 此 print 会通过 StreamToLogger 写入日志
+            print(report)  
             update_yaml_report(YAML_FILE, row_index, "Success" if final_success else "Failure")
 
         except Exception as e:
-            # 详细记录报错异常
             print(f"❌ Critical Error in loop for {p_name}: {e}")
             import traceback
             print(traceback.format_exc())
             update_yaml_report(YAML_FILE, row_index, "Failure")
 
         finally:
-            # 【恢复标准输出】：必须在循环末尾恢复，防止下一个项目的日志串流
             sys.stdout = stdout_bak
             sys.stderr = stderr_bak
 
-            # 【强制物理落地】：刷新缓冲区，确保思维链全部写入磁盘
             for handler in logger.handlers:
                 handler.flush()
                 if hasattr(handler, 'stream') and hasattr(handler.stream, 'flush'):
